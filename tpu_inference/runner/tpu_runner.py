@@ -838,9 +838,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # PROFILING HOOK: forward pass start
             import time as _fwd_time
             _fwd_start_ts = _fwd_time.time()
-            _fwd_start_evt = torch.cuda.Event(enable_timing=True)
-            _fwd_end_evt = torch.cuda.Event(enable_timing=True)
-            _fwd_start_evt.record()
 
             with set_forward_context(
                     None,
@@ -865,10 +862,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  )
             
             # PROFILING HOOK: forward pass end
-            _fwd_end_evt.record()
-            torch.cuda.synchronize()
+            jax.block_until_ready(hidden_states)
             _fwd_end_ts = _fwd_time.time()
-            _fwd_dur_ms = _fwd_start_evt.elapsed_time(_fwd_end_evt)
+            _fwd_dur_ms = (_fwd_end_ts - _fwd_start_ts) * 1000.0
             try:
                 from vllm.profiling.fp_logger import get_fp_logger as _gfl
                 model_name = self.vllm_config.model_config.model.split("/")[-1]
