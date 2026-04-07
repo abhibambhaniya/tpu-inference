@@ -25,6 +25,7 @@ import jaxtyping
 import numpy as np
 import vllm.envs as vllm_envs
 from flax import nnx
+from vllm.platforms import current_platform
 from jax._src import mesh as mesh_lib
 from jax._src.pallas.utils import next_power_of_2
 from jax.experimental import mesh_utils
@@ -834,6 +835,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # but text-only model will use input_ids
         with self.maybe_forbid_compile:
 
+            # PROFILING HOOK: forward pass start
+            import time as _fwd_time
+            _fwd_start_ts = _fwd_time.time()
+            _fwd_start_evt = torch.cuda.Event(enable_timing=True)
+            _fwd_end_evt = torch.cuda.Event(enable_timing=True)
+            _fwd_start_evt.record()
+
             with set_forward_context(
                     None,
                     self.vllm_config,
@@ -855,6 +863,57 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+            
+            # PROFILING HOOK: forward pass end
+            _fwd_end_evt.record()
+            torch.cuda.synchronize()
+            _fwd_end_ts = _fwd_time.time()
+            _fwd_dur_ms = _fwd_start_evt.elapsed_time(_fwd_end_evt)
+            try:
+                from vllm.profiling.fp_logger import get_fp_logger as _gfl
+                model_name = self.vllm_config.model_config.model.split("/")[-1]
+                TP = self.vllm_config.parallel_config.tensor_parallel_size
+                device = current_platform.get_device_name()
+                csv_filename = f"{model_name}_{device}_{TP}.csv"
+                _fl = _gfl(csv_filename)
+                
+                if _fl:
+                    _req_ids = list(self.input_batch.req_ids)
+                    _ntoks = {
+                        r: scheduler_output.num_scheduled_tokens.get(r, 0)
+                        for r in _req_ids
+                    }
+                    _req_details = {}
+                    for _rid in _req_ids:
+                        _rs = self.requests.get(_rid)
+                        if _rs is None:
+                            continue
+                        _nsched = _ntoks.get(_rid, 0)
+                        if os.environ.get("VLLM_PROFILE_TYPE", "default") == "default":
+                            _req_details[_rid] = {
+                                "num_scheduled_tokens": _nsched,
+                                "is_prefill": _nsched > 1,
+                                "past_kv_cache_size": _rs.num_computed_tokens,
+                                "prefix_tokens": len(_rs.prompt_token_ids),
+                                "decode_tokens": _nsched if _nsched == 1 else 0,
+                                "tokens_generated_so_far": len(_rs.output_token_ids),
+                                "num_prompt_tokens": len(_rs.prompt_token_ids),
+                            }
+                        else:
+                        # prefill : (_rs.num_computed_tokens, _nsched)
+                        # context : (len(_rs.prompt_token_ids)
+                        # decode : (len(_rs.output_token_ids))
+                            _req_details[_rid] = {
+                                "prefill": (_rs.num_computed_tokens, _nsched) if _nsched > 1 else None,
+                                "context": len(_rs.prompt_token_ids) + len(_rs.output_token_ids),
+                                "decode": len(_rs.output_token_ids),
+                            }
+                    _fl.record(_fwd_start_ts, _fwd_end_ts, _fwd_dur_ms,
+                            _req_ids, _ntoks, _req_details)
+            except Exception as e:
+                print(f"[profiling] Error occurred while logging forward pass: {e}", flush=True)
+
+            
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
